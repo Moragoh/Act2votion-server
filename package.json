@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "jest"
+    "test": "jest",
+    "pipeline": "ts-node --project tsconfig.run.json src/scripts/pipeline.ts"
   },
   "keywords": [],
   "author": "",
