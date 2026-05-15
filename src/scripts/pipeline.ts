@@ -132,9 +132,13 @@ function buildCombinedDevotionalJson(): void {
 
 function readAllParsedEntries(): DevotionalEntry[] {
   if (!fs.existsSync(PARSED_DIR)) return [];
+  // Sort ascending so the newest-downloaded PDF is read last and wins the
+  // last-seen-wins dedup in deduplicateByDate. Without an explicit sort,
+  // fs.readdirSync order is undefined and dedup winners can flip between runs.
   return fs
     .readdirSync(PARSED_DIR)
     .filter((name) => name.endsWith(".json"))
+    .sort()
     .flatMap((name) => {
       const contents = fs.readFileSync(path.join(PARSED_DIR, name), "utf-8");
       return JSON.parse(contents) as DevotionalEntry[];

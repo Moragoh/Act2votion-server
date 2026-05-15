@@ -9,6 +9,8 @@ export interface DevotionalEntry {
   type: "bible_text" | "memory_verse";
   verses: string;
   content: string;
+  // ISO date of the earliest entry in the source PDF — groups entries by booklet
+  source_pdf_id: string;
 }
 
 // ─── Orchestrator ────────────────────────────────────────────────────────────
@@ -47,7 +49,17 @@ export function extractDevotionalEntries(pages: Page[]): DevotionalEntry[] {
     }
   }
 
-  return entries;
+  return sortAndStampSourcePdfId(entries);
+}
+
+function sortAndStampSourcePdfId(entries: DevotionalEntry[]): DevotionalEntry[] {
+  const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
+  const earliestEntry = sorted[0];
+  const sourcePdfId = earliestEntry ? earliestEntry.date : "";
+  for (const entry of sorted) {
+    entry.source_pdf_id = sourcePdfId;
+  }
+  return sorted;
 }
 
 // ─── Page Classification ──────────────────────────────────────────────────────
@@ -98,6 +110,7 @@ function extractBibleTextEntry(texts: Text[]): DevotionalEntry {
     type: "bible_text",
     verses: extractBibleTextReference(texts),
     content: extractDiscussionQuestions(texts),
+    source_pdf_id: "",
   };
 }
 
@@ -107,6 +120,7 @@ function extractMemoryVerseEntry(texts: Text[]): DevotionalEntry {
     type: "memory_verse",
     verses: extractMemoryVerseReference(texts),
     content: extractMemoryVerseText(texts),
+    source_pdf_id: "",
   };
 }
 

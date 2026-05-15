@@ -95,6 +95,32 @@ describe("extractDevotionalEntries (integration)", () => {
     expect(uniqueDates.size).toBe(entries.length);
   });
 
+  it("is sorted by date ascending", () => {
+    const dates = entries.map((e) => e.date);
+    const sortedDates = [...dates].sort();
+    expect(dates).toEqual(sortedDates);
+  });
+
+  describe("source_pdf_id", () => {
+    it("stamps every entry with a non-empty source_pdf_id", () => {
+      for (const entry of entries) {
+        expect(entry.source_pdf_id).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      }
+    });
+
+    it("uses the earliest entry's date as the source_pdf_id", () => {
+      const earliestDate = entries[0]?.date;
+      expect(earliestDate).toBeDefined();
+      for (const entry of entries) {
+        expect(entry.source_pdf_id).toBe(earliestDate);
+      }
+    });
+
+    it("source_pdf_id matches the booklet start date in this fixture", () => {
+      expect(entries[0]?.source_pdf_id).toBe("2026-01-19");
+    });
+  });
+
   describe("bible_text entry spot-check (January 19, 2026)", () => {
     let entry: DevotionalEntry | undefined;
 
