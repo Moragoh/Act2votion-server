@@ -2,9 +2,22 @@
 
 ## Overview
 
-Act2votion is a companion server for a daily devotional PDF. The PDF contains Bible verses and discussion questions organized by date. The server's job is to automatically fetch the latest PDF from the devotional website, parse it, and serve today's verse and discussion questions via a REST API to an iOS widget.
+Act2votion is a companion server for a daily devotional PDF. The PDF contains Bible verses and discussion questions organized by date. The server's job is to automatically fetch the latest PDF from the devotional website, parse it, and publish a static JSON file to GitHub Pages that an iOS widget consumes.
 
-This document describes what has been built so far.
+---
+
+## Architecture
+
+```
+GitHub Actions (daily cron at 10:00 UTC / 5:00 AM EST)
+  ├── 1. pdfFetcher  → downloads PDF to temp, deduplicates by SHA-256
+  ├── 2. pdfConverter → converts PDF to raw pdf2json JSON
+  ├── 3. pdfParser   → extracts structured DevotionalEntry[]
+  └── 4. Deploy      → publishes public/devotional.json to GitHub Pages
+
+GitHub Pages (static hosting)
+  └── devotional.json  ← iOS widget fetches this URL
+```
 
 ---
 
@@ -12,15 +25,25 @@ This document describes what has been built so far.
 
 ```
 act2votion-server/
-├── data/                        # Runtime artifacts (created automatically at runtime)
-│   ├── pdfs/                    # Downloaded PDF files, named by date (e.g. 2026-03-17.pdf)
-│   └── converted/               # Raw pdf2json output, one JSON file per PDF (e.g. 2026-03-17.json)
+├── data/                        # Runtime artifacts committed to repo (created automatically)
+│   ├── pdfs/                    # Up to 3 most recent downloaded PDFs, named by date (e.g. 2026-03-17.pdf)
+│   ├── converted/               # Raw pdf2json output, one JSON file per PDF (e.g. 2026-03-17.json)
+│   └── parsed/                  # Structured DevotionalEntry[] arrays, one JSON file per PDF
+├── public/                      # Pipeline output (gitignored on main; deployed to gh-pages)
+│   └── devotional.json          # Combined entries from all stored PDFs
 ├── src/
 │   ├── services/
 │   │   ├── pdfFetcher.ts        # Scrapes website and downloads the latest PDF
-│   │   └── pdfConverter.ts      # Converts a downloaded PDF to raw pdf2json JSON
+│   │   ├── pdfConverter.ts      # Converts a downloaded PDF to raw pdf2json JSON
+│   │   └── pdfParser.ts         # Parses raw JSON into DevotionalEntry[]
 │   └── scripts/
-│       └── runFetch.ts          # One-shot manual test script for the PDF fetcher
+│       ├── pipeline.ts          # Full pipeline orchestrator — this is what GitHub Actions runs
+│       ├── runFetch.ts          # One-shot manual test script for the PDF fetcher
+│       ├── runParser.ts         # One-shot manual test script for the PDF parser
+│       └── inspectPdf.ts        # Dumps raw pdf2json output to stdout for debugging
+├── .github/
+│   └── workflows/
+│       └── update-devotional.yml # GitHub Actions workflow: daily cron + manual trigger
 ├── agent_files/                 # Agent/developer reference files
 ├── jest.config.js
 ├── tsconfig.json                # Base TypeScript config (type-checking)
@@ -32,61 +55,122 @@ act2votion-server/
 
 ## What Has Been Built
 
+### `src/scripts/pipeline.ts`
+
+The pipeline orchestrator. Run locally with `npm run pipeline` or automatically via GitHub Actions. Executes the full end-to-end pipeline:
+
+1. **Download** — fetches the latest PDF from the devotional website to a temporary file in `os.tmpdir()`
+2. **Deduplicate** — computes a SHA-256 hash of the downloaded PDF and compares it against every PDF in `data/pdfs/`. If a match is found, the temp file is deleted and processing is skipped.
+3. **Rotate** — if `data/pdfs/` already contains 3 PDFs and the new one is unique, deletes the oldest PDF and its corresponding files in `data/converted/` and `data/parsed/` to make room.
+4. **Save** — copies the temp file to `data/pdfs/{today}.pdf`
+5. **Convert & Parse** — calls `convertPdfToJson` then `parseConvertedJson`
+6. **Combine** — reads every file in `data/parsed/`, merges all `DevotionalEntry[]` arrays, deduplicates by date, sorts chronologically, and writes the result to `public/devotional.json`
+
+---
+
+### `src/services/pdfParser.ts`
+
+Reads a raw `data/converted/<date>.json` file produced by the converter, extracts daily Bible text and memory verse entries keyed by date, and writes structured JSON to `data/parsed/`.
+
+#### `parseConvertedJson(jsonFilePath: string): Promise<string>`
+The public entry point. Reads the JSON file, runs `extractDevotionalEntries`, and writes the result to `data/parsed/`.
+
+---
+
+#### `extractDevotionalEntries(pages: Page[]): DevotionalEntry[]`
+Iterates pages, classifies each page type, extracts the appropriate entry, and deduplicates by date. Returns a `DevotionalEntry[]`.
+
+---
+
+#### `DevotionalEntry` (interface)
+
+```ts
+interface DevotionalEntry {
+  date: string;             // ISO date, e.g. "2026-03-17"
+  type: "bible_text" | "memory_verse";
+  verses: string;           // e.g. "John 8:12-30 (ESV)"
+  content: string;          // discussion questions or memory verse text
+}
+```
+
+---
+
+#### Page classification heuristics
+
+| Page type | Signal |
+|---|---|
+| Blank / cover | No `Text` blocks |
+| Commentary | `font size 14` block containing `"Commentary on"` |
+| Bible text (discussion questions) | Date block (`font size 13`) + `"Bible Text:"` block (`font size 14`) |
+| Memory verse | Date block (`font size 13`) + `"Memory Verse"` block (`font size 14`) |
+| Skip (journal, etc.) | Anything else |
+
+---
+
 ### `src/services/pdfConverter.ts`
 
-The PDF converter is responsible for turning a downloaded PDF file into raw structured JSON using `pdf2json`. It exports two functions:
+Converts a PDF file to raw structured JSON using `pdf2json`.
 
 #### `convertPdfToJson(pdfFilePath: string): Promise<string>`
-The public entry point. Orchestrates the conversion pipeline:
-1. Parse the PDF file into a raw `Output` object using `pdf2json`
-2. Derive the output JSON file path from the PDF's base name
-3. Write the JSON to `data/converted/`
-
-Returns the path of the saved JSON file (e.g. `data/converted/2026-03-17.json`). This is the file the parser will consume in the next pipeline stage.
+Parses the PDF via a `PDFParser` event emitter, writes the raw `Output` JSON to `data/converted/`, and returns the output path.
 
 ---
 
 #### `buildConvertedJsonOutputPath(pdfFilePath: string): string`
-Derives the output JSON path from the PDF input path: strips the `.pdf` extension, replaces it with `.json`, and places the file in `data/converted/`.
+Derives the output JSON path from the PDF's base name and places it in `data/converted/`.
 
 ---
 
 ### `src/services/pdfFetcher.ts`
 
-The PDF fetcher is responsible for the full pipeline of finding and downloading the latest devotional PDF. It exports five functions:
+Finds and downloads the latest devotional PDF.
 
 #### `downloadLatestPdf(): Promise<string>`
-The public entry point. Orchestrates the full pipeline:
-1. Scrape the devotional website for the PDF link
-2. Convert the preview link to a direct download link
-3. Build a date-based output file path
-4. Download the PDF to disk
-
-Returns the path of the saved file (e.g. `data/pdfs/2026-03-17.pdf`).
+Orchestrates the full pipeline: scrape → convert preview URL → build output path → download. Returns the saved file path.
 
 ---
 
 #### `scrapeLatestPdfUrl(websiteUrl: string): Promise<string>`
-Uses `axios` to fetch the HTML of the devotional website and `cheerio` to find the first anchor tag whose `href` contains `.pdf`.
-
-**Important:** The selector uses `a[href*=".pdf"]` (contains), not `a[href$=".pdf"]` (ends-with). The PDF links on this site are Dropbox URLs with query parameters appended after the `.pdf` extension (e.g. `file.pdf?rlkey=...&dl=0`), which would break an ends-with selector.
-
-Throws an error if no PDF link is found on the page.
+Fetches the website HTML and finds the first anchor with `.pdf` in its `href` using the `a[href*=".pdf"]` selector (contains, not ends-with — the links have query parameters after `.pdf`).
 
 ---
 
 #### `buildDownloadableUrl(previewUrl: string): string`
-The scraped Dropbox link is a preview link (`dl=0`). This function swaps `dl=0` for `dl=1`, which tells Dropbox to serve the raw file as a download instead of a browser preview.
+Swaps `dl=0` for `dl=1` in a Dropbox preview URL to get a direct download link.
 
 ---
 
 #### `buildOutputFilePath(outputDir: string): string`
-Derives the output filename from today's date in `YYYY-MM-DD` format (e.g. `2026-03-17.pdf`) and joins it with the given output directory. The output directory is `data/pdfs/` relative to the project root.
+Returns `{outputDir}/{YYYY-MM-DD}.pdf` using today's date.
 
 ---
 
 #### `downloadPdfToFile(downloadUrl: string, outputFilePath: string): Promise<void>`
-Downloads the PDF as a binary stream using `axios` with `responseType: "stream"` and pipes it to a file using `fs.createWriteStream`. Creates the output directory if it does not already exist. Resolves when the write stream emits `finish`, or rejects on a stream error.
+Downloads the PDF as a binary stream and pipes it to disk. Creates the output directory if needed.
+
+---
+
+## GitHub Actions Workflow
+
+**File:** `.github/workflows/update-devotional.yml`
+
+Triggers:
+- `schedule`: daily at 10:00 UTC (5:00 AM EST)
+- `workflow_dispatch`: manual trigger from the GitHub UI
+
+Steps:
+1. Checkout main branch
+2. `npm ci`
+3. `npm run pipeline` — runs the full pipeline
+4. Commits any changes to `data/` back to main (enables dedup and rotation to persist across runs)
+5. Deploys `public/` to the `gh-pages` branch via `peaceiris/actions-gh-pages@v4`
+
+The iOS client fetches the JSON from:
+```
+https://<username>.github.io/<repo-name>/devotional.json
+```
+
+To enable GitHub Pages: go to repo Settings → Pages → set source to the `gh-pages` branch.
 
 ---
 
@@ -94,74 +178,59 @@ Downloads the PDF as a binary stream using `axios` with `responseType: "stream"`
 
 ### Automated Tests
 
-Run the full test suite with:
-
 ```sh
 npm test
 ```
 
-Tests are in `src/__tests__/`. There are 8 unit tests across two test files, all of which run offline using mocks.
-
-**`src/__tests__/pdfConverter.test.ts`** (3 tests)
-
-| Test | What it verifies |
-|---|---|
-| `buildConvertedJsonOutputPath` | Returns a path in `data/converted/` with a `.json` extension matching the PDF base name |
-| `convertPdfToJson` — success | Calls `mkdirSync` and `writeFileSync` with the correct paths and resolves with the output path |
-| `convertPdfToJson` — parse error | Rejects when pdf2json emits `pdfParser_dataError` |
-
-**Mocking strategy for `pdfConverter`:**
-- `pdf2json` is mocked as a jest constructor; `loadPDF` uses `setImmediate` to emit `pdfParser_dataReady` asynchronously, matching real event-based behaviour
-- `fs` is fully mocked — no files are written to disk
+Tests are in `src/__tests__/`. There are 27 unit tests across three test files, all of which run offline using mocks.
 
 **`src/__tests__/pdfFetcher.test.ts`** (5 tests)
 
 | Test | What it verifies |
 |---|---|
 | `scrapeLatestPdfUrl` — finds PDF link | Returns the correct `href` from a page with a PDF anchor tag |
-| `scrapeLatestPdfUrl` — no PDF found | Throws an error when the page has no PDF link |
-| `buildDownloadableUrl` | Correctly replaces `dl=0` with `dl=1` |
+| `scrapeLatestPdfUrl` — no PDF found | Throws when no PDF link is present |
+| `buildDownloadableUrl` | Replaces `dl=0` with `dl=1` |
 | `buildOutputFilePath` | Returns a `YYYY-MM-DD.pdf` path inside the given directory |
-| `downloadPdfToFile` | Calls `mkdirSync` and `createWriteStream` with the correct arguments and resolves when the stream finishes |
+| `downloadPdfToFile` | Calls `mkdirSync` and `createWriteStream` correctly and resolves on stream finish |
 
-**Mocking strategy for `pdfFetcher`:**
-- `axios` is mocked via `jest.mock("axios")` — no real HTTP requests are made
-- `fs` is mocked via `jest.mock("fs", ...)` with only `mkdirSync` and `createWriteStream` replaced — no real files are written
-- Stream piping is tested using Node.js `PassThrough` streams; `setImmediate` is used to end the readable stream after the pipe is set up, which triggers the `finish` event on the write stream
+**`src/__tests__/pdfConverter.test.ts`** (3 tests)
+
+| Test | What it verifies |
+|---|---|
+| `buildConvertedJsonOutputPath` | Returns a path in `data/converted/` with `.json` extension |
+| `convertPdfToJson` — success | Writes JSON to disk and resolves with the output path |
+| `convertPdfToJson` — parse error | Rejects when pdf2json emits `pdfParser_dataError` |
+
+**`src/__tests__/pdfParser.test.ts`** (19 tests)
+
+Covers page classification, date extraction, Bible text reference extraction, discussion question extraction, memory verse extraction, deduplication, and the `isBibleReference` / `formatDateToIso` helpers.
 
 ---
 
-### Manual End-to-End Test
-
-To verify that the fetcher actually hits the website and saves a real PDF to disk:
-
-**1. Run the fetch script:**
+### Running the Pipeline Manually
 
 ```sh
-npx ts-node --project tsconfig.run.json src/scripts/runFetch.ts
+npm run pipeline
 ```
 
-**2. Expected console output:**
-
+Expected output (new PDF):
 ```
-Fetching latest devotional PDF...
-PDF saved to: /path/to/project/data/pdfs/2026-03-17.pdf
-```
-
-**3. Verify the file was saved:**
-
-```sh
-ls data/pdfs/
+Starting devotional pipeline...
+Saved new PDF: /path/to/project/data/pdfs/2026-03-17.pdf
+Converted to JSON: /path/to/project/data/converted/2026-03-17.json
+Parsed entries: /path/to/project/data/parsed/2026-03-17.json
+Written N entries to public/devotional.json
+Pipeline complete.
 ```
 
-You should see a file named with today's date (e.g. `2026-03-17.pdf`). You can open it to confirm it is a valid, readable PDF.
-
-**4. If it fails:**
-
-Common failure reasons:
-- **No PDF link found** — the website structure may have changed; inspect the page source and verify there is an anchor tag with `.pdf` in the `href`
-- **Network error** — check your internet connection and that `https://devotions.acts2.network/` is reachable
-- **Write error** — check that the project root directory is writable
+Expected output (unchanged PDF):
+```
+Starting devotional pipeline...
+PDF unchanged — skipping conversion and parsing.
+Written N entries to public/devotional.json
+Pipeline complete.
+```
 
 ---
 
@@ -169,19 +238,8 @@ Common failure reasons:
 
 | Package | Purpose |
 |---|---|
-| `axios` | HTTP client — fetches the website HTML and downloads the PDF stream |
+| `axios` | HTTP client — fetches website HTML and downloads the PDF stream |
 | `cheerio` | Server-side HTML parsing — finds the PDF anchor tag |
-| `pdf2json` | PDF parsing — converts downloaded PDFs to structured JSON (`Output` type with `Meta` and `Pages[]`) |
+| `pdf2json` | PDF parsing — converts PDFs to structured JSON (`Output` type with `Meta` and `Pages[]`) |
 | `ts-jest` | Runs TypeScript tests in Jest |
-| `ts-node` | Runs TypeScript scripts directly (used for the manual test script) |
-
----
-
-## What Comes Next
-
-The following components are planned but not yet implemented:
-
-- **`src/services/pdfParser.ts`** — reads the raw `data/converted/<date>.json` produced by the converter, extracts daily verses and discussion questions keyed by date, and writes structured JSON to `data/parsed/`
-- **`src/scheduler/pdfUpdateJob.ts`** — daily cron job that calls the fetcher, checks if the PDF is new, triggers the converter, then the parser
-- **`src/api/router.ts` and `src/api/devotionalController.ts`** — Express routes and controller to serve `GET /devotional/today` to the iOS widget
-- **`src/index.ts`** — entry point that starts the Express server and registers the cron job
+| `ts-node` | Runs TypeScript scripts directly |
